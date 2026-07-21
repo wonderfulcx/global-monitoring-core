@@ -105,6 +105,25 @@ async function getExactCommsCount(
   }
 }
 
+// Agent-name lookup, tolerant of the platform version. V2 tenants disable
+// /api/v1/agents (403 → "use /api/v3/agents"); V1 tenants serve v1. Try v3
+// first, fall back to v1. Names are enrichment (monitors still work without
+// them), so never throw — return an empty map if both are unavailable.
+async function fetchAgentNames(baseUrl: string, apiKey: string): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  for (const path of [`/api/v3/agents?filters=${EMPTY_FILTERS}&limit=1000`, `/api/v1/agents?filters=${EMPTY_FILTERS}&limit=1000`]) {
+    const r = await getList(baseUrl, apiKey, path);
+    if (r.error || r.items.length === 0) continue;
+    for (const a of r.items) {
+      const id = a.id as string | undefined;
+      const nm = (a.display_name as string) ?? (a.name as string) ?? undefined;
+      if (id && nm) map.set(id, nm);
+    }
+    if (map.size > 0) break;
+  }
+  return map;
+}
+
 const isOpenAlert = (i: Record<string, unknown>) => String(i.status ?? "").toLowerCase() === "open";
 // Matches wonderful-ui's homepage.api.ts fetchIssuesSummary:
 // open = status in {"open","pending","in-progress"}.
@@ -258,7 +277,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
   const issuesRange = window.start !== null && window.end !== null ? `&startDate=${window.start}&endDate=${window.end}` : "";
   const alertsRange = window.start !== null && window.end !== null ? `&start_date=${window.start}&end_date=${window.end}` : "";
 
-  const [issues, incidents, commsWindow, issuesWindow, alertsWindow, monitorsRaw, agentsRaw, business] =
+  const [issues, incidents, commsWindow, issuesWindow, alertsWindow, monitorsRaw, agentNameById, business] =
     await Promise.all([
       getList(baseUrl, apiKey, `/api/v1/issues?filters=${EMPTY_FILTERS}&limit=1000`),
       getList(baseUrl, apiKey, `/api/v1/alerts/incidents?filters=${EMPTY_FILTERS}&limit=1000&withPreloads=true`),
@@ -266,7 +285,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
       getList(baseUrl, apiKey, `/api/v1/issues?filters=${EMPTY_FILTERS}&limit=1${issuesRange}`),
       getList(baseUrl, apiKey, `/api/v1/alerts/incidents?filters=${EMPTY_FILTERS}&limit=1${alertsRange}`),
       getList(baseUrl, apiKey, `/api/v1/alerts?filters=${EMPTY_FILTERS}&limit=1000`),
-      getList(baseUrl, apiKey, `/api/v1/agents?filters=${EMPTY_FILTERS}&limit=1000`),
+      fetchAgentNames(baseUrl, apiKey),
       fetchBusinessMetrics(baseUrl, apiKey, window),
     ]);
 
@@ -275,12 +294,6 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
   const activeAlerts = openIncidents.length;
   const alertDetails = openIncidents.map(toAlertDetail).sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 
-  const agentNameById = new Map<string, string>();
-  for (const a of agentsRaw.items) {
-    const id = a.id as string | undefined;
-    const nm = (a.name as string) ?? (a.display_name as string) ?? undefined;
-    if (id && nm) agentNameById.set(id, nm);
-  }
   const monitors = monitorsRaw.items
     .map((m) => toMonitorDetail(m, agentNameById))
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
@@ -293,7 +306,6 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     ["issues_in_window", issuesWindow],
     ["alerts_in_window", alertsWindow],
     ["monitors", monitorsRaw],
-    ["agents", agentsRaw],
   ] as [string, ListResult][])
     if (r.error) errors.push(`${label}: ${r.error}`);
   if (commsWindow.error) errors.push(`interactions: ${commsWindow.error}`);
