@@ -270,6 +270,59 @@ async function fetchBusinessMetrics(
 // The full rich per-tenant read, windowed. Used by the hub (pull) directly,
 // and by the push cron (Pattern A) to compute the payload it emits — so both
 // sides produce an identical tenant object from one code path.
+// Live per-agent KPI VALUES in one call, scoped to the window. POST
+// /api/v2/query/metric-stats with group_by=agent_id returns each metric's
+// groups[] keyed by group_value (agent id), each carrying
+// {pass,fail,excluded,total,pass_rate}. Works on V2 tenants (the v1 per-agent
+// metric endpoints are 403'd under agent_studio_v2). Agent display names are
+// joined by the caller via the version-tolerant name lookup. Never throws —
+// this is enrichment; a failure returns an empty list + error string.
+type AgentKpi = { name: string; pass_rate: number; pass: number; total: number; excluded: number };
+type AgentKpiBreakdown = { id: string; name: string; kpis: AgentKpi[] };
+
+async function fetchPerAgentKpis(
+  baseUrl: string,
+  apiKey: string,
+  window: TimeWindow,
+): Promise<{ agents: AgentKpiBreakdown[]; error?: string }> {
+  try {
+    const body: Record<string, unknown> = { group_by: "agent_id", filter: {} };
+    if (window.start !== null && window.end !== null) body.time_range = { start: window.start, end: window.end };
+    const raw = (await apiCall(baseUrl, `/api/v2/query/metric-stats`, apiKey, {
+      method: "POST",
+      body: JSON.stringify(body),
+    })) as Record<string, unknown>;
+    const data = (raw?.data ?? raw) as Record<string, unknown>;
+    const metrics = Array.isArray(data?.metrics) ? (data.metrics as Record<string, unknown>[]) : [];
+    const byAgent = new Map<string, AgentKpi[]>();
+    for (const m of metrics) {
+      const metricName = (m.metric_name as string) ?? (m.name as string) ?? "";
+      const groups = Array.isArray(m.groups) ? (m.groups as Record<string, unknown>[]) : [];
+      for (const g of groups) {
+        const agentId = (g.group_value as string) ?? "";
+        if (!agentId || !metricName) continue;
+        const list = byAgent.get(agentId) ?? [];
+        list.push({
+          name: metricName,
+          pass_rate: typeof g.pass_rate === "number" ? g.pass_rate : 0,
+          pass: typeof g.pass === "number" ? g.pass : 0,
+          total: typeof g.total === "number" ? g.total : 0,
+          excluded: typeof g.excluded === "number" ? g.excluded : 0,
+        });
+        byAgent.set(agentId, list);
+      }
+    }
+    const agents: AgentKpiBreakdown[] = [...byAgent.entries()].map(([id, kpis]) => ({
+      id,
+      name: id, // enriched with the display name by the caller
+      kpis: kpis.sort((a, b) => a.name.localeCompare(b.name)),
+    }));
+    return { agents };
+  } catch (e) {
+    return { agents: [], error: (e as Error).message ?? String(e) };
+  }
+}
+
 async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string | undefined, window: TimeWindow) {
   if (!apiKey) return { name, error: "missing_api_key", severity: "attention" as Severity };
 
@@ -277,7 +330,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
   const issuesRange = window.start !== null && window.end !== null ? `&startDate=${window.start}&endDate=${window.end}` : "";
   const alertsRange = window.start !== null && window.end !== null ? `&start_date=${window.start}&end_date=${window.end}` : "";
 
-  const [issues, incidents, commsWindow, issuesWindow, alertsWindow, monitorsRaw, agentNameById, business] =
+  const [issues, incidents, commsWindow, issuesWindow, alertsWindow, monitorsRaw, agentNameById, business, perAgent] =
     await Promise.all([
       getList(baseUrl, apiKey, `/api/v1/issues?filters=${EMPTY_FILTERS}&limit=1000`),
       getList(baseUrl, apiKey, `/api/v1/alerts/incidents?filters=${EMPTY_FILTERS}&limit=1000&withPreloads=true`),
@@ -287,6 +340,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
       getList(baseUrl, apiKey, `/api/v1/alerts?filters=${EMPTY_FILTERS}&limit=1000`),
       fetchAgentNames(baseUrl, apiKey),
       fetchBusinessMetrics(baseUrl, apiKey, window),
+      fetchPerAgentKpis(baseUrl, apiKey, window),
     ]);
 
   const openIssues = issues.items.filter(isOpenIssue).length;
@@ -299,6 +353,11 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   const monitorAggregation = aggregateMonitors(monitors);
 
+  // Per-agent KPI values, display names joined from the version-tolerant lookup.
+  const agents = perAgent.agents
+    .map((a) => ({ ...a, name: agentNameById.get(a.id) ?? a.id }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   const errors: string[] = [];
   for (const [label, r] of [
     ["issues", issues],
@@ -310,6 +369,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     if (r.error) errors.push(`${label}: ${r.error}`);
   if (commsWindow.error) errors.push(`interactions: ${commsWindow.error}`);
   if (business.error) errors.push(`business_metrics: ${business.error}`);
+  if (perAgent.error) errors.push(`per_agent_kpis: ${perAgent.error}`);
 
   return {
     name,
@@ -324,6 +384,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     monitors_by_severity: monitorAggregation.bySeverity,
     monitors_by_agent: monitorAggregation.byAgent,
     business_metrics: business.metrics,
+    agents,
     ...(errors.length ? { errors } : {}),
   };
 }
