@@ -174,10 +174,15 @@ function aggregateMonitors(monitors: MonitorDetail[]) {
 }
 
 // PLACEHOLDER severity mapping — not a decided product spec.
-function classifySeverity(activeAlerts: number, openIssues: number): Severity {
+// healthUnknown: when the reads that DETERMINE health (issues + alerts) failed,
+// their zero counts are not trustworthy — reporting "healthy" (green) off
+// un-read data is misleading. Surface "attention" instead. A failure in a
+// non-health read (e.g. business metrics) does NOT force this — the alerts/
+// issues signal is still valid, and the partial-data errors are shown anyway.
+function classifySeverity(activeAlerts: number, openIssues: number, healthUnknown = false): Severity {
   if (activeAlerts > 0) return "critical";
   if (openIssues > 0) return "attention";
-  return "healthy";
+  return healthUnknown ? "attention" : "healthy";
 }
 
 function startOfUtcDay(ts: number): number {
@@ -378,7 +383,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     alerts_triggered: alertsWindow.total,
     open_issues: openIssues,
     active_alerts: activeAlerts,
-    severity: classifySeverity(activeAlerts, openIssues),
+    severity: classifySeverity(activeAlerts, openIssues, !!(issues.error || incidents.error)),
     alerts: alertDetails,
     monitors,
     monitors_by_severity: monitorAggregation.bySeverity,
