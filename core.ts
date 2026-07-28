@@ -19,7 +19,6 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 
 type TenantRegistryEntry = { name: string; api_url: string; key_secret: string };
 type ListResult = { items: Record<string, unknown>[]; total: number; error?: string };
-type Severity = "critical" | "attention" | "healthy";
 type AlertSeverity = "High" | "Medium" | "Low" | "Unknown";
 type AlertDetail = { name: string; severity: AlertSeverity; status: string; triggered_at: number | null };
 type MonitorDetail = { name: string; description: string; severity: AlertSeverity; agent_name: string; active: boolean };
@@ -35,6 +34,36 @@ type BusinessMetric = {
 };
 type RangeKey = "week" | "last7" | "last30" | "all";
 type TimeWindow = { range: RangeKey; start: number | null; end: number | null; label: string };
+
+// --- Technical ops ----------------------------------------------------------
+// The dashboard colour scale. sev1 = dark red (attend now), sev2 = red,
+// sev3 = orange (investigate), ok = green. `unknown` is NOT a severity: it
+// means we could not determine health, and must never render as green.
+type OpsSeverity = "sev1" | "sev2" | "sev3" | "ok" | "unknown";
+type AgentServiceHealth = { agent_id: string; status: string; unhealthy_services: string[] };
+type ServiceHealth = { available: boolean; agents: AgentServiceHealth[]; unhealthy_count: number; error?: string };
+type NamedAvg = { key: string; avg_ms: number };
+type TagCounts = { error: number; warning: number; info: number; other: number };
+type SeriesPoint = { at: string; value: number };
+// One verdict = the latest decision of one detector for one agent, produced by
+// the TENANT's own monitoring framework. We consume these; we never recompute
+// its baselines, opening hours or known-event normalisation.
+type DetectorVerdict = {
+  detector: string;
+  agent_name: string;
+  severity: OpsSeverity;
+  raw_severity: string;
+  status: string;
+  would_notify: boolean;
+};
+type DetectorFeed = { available: boolean; verdicts: DetectorVerdict[]; undetermined: number; error?: string };
+type AgentTechSignals = {
+  agent_id: string;
+  agent_name: string;
+  agent_latency_ms: number | null;
+  tag_counts: TagCounts;
+  interactions: number;
+};
 
 // Secret shape for "API Key" type secrets, defensively unwrapped — seen as
 // { value: { api_key: "..." } }; tolerate a few shapes rather than assume one.
@@ -173,16 +202,112 @@ function aggregateMonitors(monitors: MonitorDetail[]) {
   return { bySeverity, byAgent };
 }
 
-// PLACEHOLDER severity mapping — not a decided product spec.
+// Business severity. Still a PLACEHOLDER threshold set — the business half of
+// the severity decision is open — but it now speaks the single OpsSeverity
+// scale instead of a second, parallel vocabulary.
 // healthUnknown: when the reads that DETERMINE health (issues + alerts) failed,
-// their zero counts are not trustworthy — reporting "healthy" (green) off
-// un-read data is misleading. Surface "attention" instead. A failure in a
-// non-health read (e.g. business metrics) does NOT force this — the alerts/
-// issues signal is still valid, and the partial-data errors are shown anyway.
-function classifySeverity(activeAlerts: number, openIssues: number, healthUnknown = false): Severity {
-  if (activeAlerts > 0) return "critical";
-  if (openIssues > 0) return "attention";
-  return healthUnknown ? "attention" : "healthy";
+// their zero counts are not trustworthy — reporting green off un-read data is
+// misleading, so report unknown. A failure in a non-health read (e.g. business
+// metrics) does NOT force this; the alerts/issues signal is still valid and the
+// partial-data errors are surfaced anyway.
+function classifyBusiness(activeAlerts: number, openIssues: number, healthUnknown = false): OpsSeverity {
+  if (healthUnknown) return "unknown";
+  if (activeAlerts > 0) return "sev2";
+  if (openIssues > 0) return "sev3";
+  return "ok";
+}
+
+// Payloads from a tenant still on an older pusher (or at T0/T1, where raw
+// detail may not leave and the source pre-computes) carry the legacy
+// critical/attention/healthy vocabulary. Translate rather than keep two scales.
+function legacySeverityToOps(raw: unknown): OpsSeverity {
+  switch (String(raw ?? "").trim().toLowerCase()) {
+    case "critical":
+      return "sev1";
+    case "attention":
+      return "sev2";
+    case "healthy":
+      return "ok";
+    default:
+      return "unknown";
+  }
+}
+
+// --- Ops severity: mapping + rollup -----------------------------------------
+// These run in the CONSUMER (hub reader), not in the tenant cron. Thresholds
+// are a product decision, so they must be tunable in one place rather than
+// redeployed to every tenant. They live here only because core.ts is the one
+// file both plugins inline.
+
+// Latency thresholds, from the L1 note ("normally 1 second … Sev1 if more than
+// 3 seconds"). Tunable — changing these re-colours history, by design.
+const AGENT_LATENCY_SEV1_MS = 3000;
+const AGENT_LATENCY_SEV2_MS = 2000;
+// Tag rates are shares of interactions, not counts ("Tag Rate instead of Tag Count").
+const ERROR_TAG_RATE_SEV2_PCT = 1;
+const WARNING_TAG_RATE_SEV3_PCT = 5;
+
+// Lower rank = worse. `unknown` outranks ok (silence is not health) but never
+// outranks a real sev3.
+const OPS_RANK: Record<OpsSeverity, number> = { sev1: 0, sev2: 1, sev3: 2, unknown: 3, ok: 4 };
+
+// Worst-of, unweighted. No args (or all-ok) yields "ok".
+function worstSeverity(...vals: OpsSeverity[]): OpsSeverity {
+  let worst: OpsSeverity = "ok";
+  for (const v of vals) if (OPS_RANK[v] < OPS_RANK[worst]) worst = v;
+  return worst;
+}
+
+// Coverage rule: "unknown" only when NOTHING could be determined. If some
+// signals reported and others could not, take the worst real determination and
+// surface the gap separately — otherwise one missing baseline greys out an
+// otherwise-known tenant.
+function rollupWithCoverage(vals: OpsSeverity[]): { severity: OpsSeverity; undetermined: number } {
+  const determined = vals.filter((v) => v !== "unknown");
+  const undetermined = vals.length - determined.length;
+  if (determined.length === 0) return { severity: vals.length ? "unknown" : "unknown", undetermined };
+  return { severity: worstSeverity(...determined), undetermined };
+}
+
+function classifyAgentLatency(avgMs: number | null): OpsSeverity {
+  if (avgMs === null || !isFinite(avgMs)) return "unknown";
+  if (avgMs > AGENT_LATENCY_SEV1_MS) return "sev1";
+  if (avgMs > AGENT_LATENCY_SEV2_MS) return "sev2";
+  return "ok";
+}
+
+// error_* tags are sev2, warning_* sev3 — per the L1 severity note. Rates, not
+// counts, so a busy agent isn't penalised for volume.
+function classifyTagRates(tags: TagCounts, interactions: number): OpsSeverity {
+  if (!interactions || interactions <= 0) return "unknown";
+  const errPct = (tags.error / interactions) * 100;
+  const warnPct = (tags.warning / interactions) * 100;
+  if (errPct >= ERROR_TAG_RATE_SEV2_PCT) return "sev2";
+  if (warnPct >= WARNING_TAG_RATE_SEV3_PCT) return "sev3";
+  return "ok";
+}
+
+// Any agent or sub-service not "healthy" is sev1 ("/stats all good, otherwise
+// Sev1"). An unreachable/absent /stats is unknown, not ok.
+function classifyServiceHealth(health: ServiceHealth): OpsSeverity {
+  if (!health.available) return "unknown";
+  if (health.agents.length === 0) return "unknown";
+  return health.unhealthy_count > 0 ? "sev1" : "ok";
+}
+
+// The tenant framework has never fired, so its non-"none" vocabulary is
+// unobserved. Anything unrecognised becomes sev2 with the raw string kept — a
+// firing detector must never be silently swallowed as green.
+function mapDetectorSeverity(rawSeverity: unknown, status: unknown, wouldNotify: unknown): OpsSeverity {
+  const s = String(rawSeverity ?? "").trim().toLowerCase();
+  const st = String(status ?? "").trim().toLowerCase();
+  if (st === "insufficient_data" || st === "error") return "unknown";
+  const notify = wouldNotify === true || String(wouldNotify).toLowerCase() === "true";
+  if (s === "" || s === "none" || s === "ok") return notify ? "sev2" : "ok";
+  if (s === "sev1" || s === "critical" || s === "high" || s === "1") return "sev1";
+  if (s === "sev2" || s === "warning" || s === "medium" || s === "2") return "sev2";
+  if (s === "sev3" || s === "info" || s === "low" || s === "3") return "sev3";
+  return "sev2";
 }
 
 function startOfUtcDay(ts: number): number {
@@ -329,7 +454,8 @@ async function fetchPerAgentKpis(
 }
 
 async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string | undefined, window: TimeWindow) {
-  if (!apiKey) return { name, error: "missing_api_key", severity: "attention" as Severity };
+  // No key means nothing could be read at all — that is unknown, not a health verdict.
+  if (!apiKey) return { name, error: "missing_api_key", severity: "unknown" as OpsSeverity };
 
   const commsRange = window.start !== null && window.end !== null ? { startDate: window.start, endDate: window.end } : undefined;
   const issuesRange = window.start !== null && window.end !== null ? `&startDate=${window.start}&endDate=${window.end}` : "";
@@ -383,7 +509,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     alerts_triggered: alertsWindow.total,
     open_issues: openIssues,
     active_alerts: activeAlerts,
-    severity: classifySeverity(activeAlerts, openIssues, !!(issues.error || incidents.error)),
+    severity: classifyBusiness(activeAlerts, openIssues, !!(issues.error || incidents.error)),
     alerts: alertDetails,
     monitors,
     monitors_by_severity: monitorAggregation.bySeverity,
