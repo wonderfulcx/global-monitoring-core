@@ -217,20 +217,32 @@ function classifyBusiness(activeAlerts: number, openIssues: number, healthUnknow
   return "ok";
 }
 
-// Payloads from a tenant still on an older pusher (or at T0/T1, where raw
-// detail may not leave and the source pre-computes) carry the legacy
-// critical/attention/healthy vocabulary. Translate rather than keep two scales.
-// Maps to whatever classifyBusiness would score from the SAME inputs, not one
-// level hotter: legacy `critical` meant activeAlerts > 0 (sev2 today) and
-// `attention` meant openIssues > 0 (sev3). Mapping critical→sev1 would escalate
-// every tenant the moment the reader ships. Kept in step with the app's
-// normalizeSeverity — if one changes, change both.
-function legacySeverityToOps(raw: unknown): OpsSeverity {
+// The ONE adapter between a snapshot's severity string and the ops scale.
+// Snapshots arrive in two vocabularies and will for as long as pushers upgrade
+// independently of the hub: a tenant pinned to an older core (or at T0/T1,
+// where raw detail may not leave and the source pre-computes) sends
+// critical/attention/healthy, a current one sends the ops scale directly.
+//
+// Legacy values map to whatever the current classifier would score from the
+// SAME inputs, not one level hotter: legacy `critical` meant activeAlerts > 0,
+// which classifyBusiness scores sev2, and `attention` meant openIssues > 0,
+// which it scores sev3. Escalating them would make every tenant look worse the
+// moment the reader ships, with nothing having changed.
+//
+// The app carries a deliberate copy of this table — it is a React bundle and
+// cannot inline core.ts. If this mapping changes, change its normalizeSeverity
+// too; they are the same decision expressed twice out of necessity.
+function normalizeOpsSeverity(raw: unknown): OpsSeverity {
   switch (String(raw ?? "").trim().toLowerCase()) {
+    case "sev1":
+      return "sev1";
+    case "sev2":
     case "critical":
       return "sev2";
+    case "sev3":
     case "attention":
       return "sev3";
+    case "ok":
     case "healthy":
       return "ok";
     default:
@@ -298,6 +310,100 @@ function classifyServiceHealth(health: ServiceHealth): OpsSeverity {
   if (!health.available) return "unknown";
   if (health.agents.length === 0) return "unknown";
   return health.unhealthy_count > 0 ? "sev1" : "ok";
+}
+
+// --- Freshness: silence is not health ---------------------------------------
+// A pushed tenant's row holds its last snapshot indefinitely, and nothing in
+// that snapshot expires. So a tenant that stops pushing keeps rendering
+// whatever colour it had at the moment it went quiet — the exact failure mode
+// behind the 11-hour blind spot on 2026-07-27. Freshness is the signal that
+// turns silence into a visible state instead of a stale green tile.
+//
+// The threshold is derived per tenant rather than fixed, because the cadence IS
+// the tenant's own cron schedule (`*/5` by default, hourly documented as a
+// supported edit) — any single hardcoded interval is wrong for somebody, and a
+// wrong one is worse than none: too tight cries wolf, too loose is the blind
+// spot we already had. `expectedIntervalMs` is the cadence the hub has actually
+// OBSERVED for that tenant.
+
+// How many consecutive pushes a tenant may miss before its status is no longer
+// current. Below this, a gap is jitter or one skipped run, not an outage.
+const FRESHNESS_MISSED_PUSHES = 3;
+// Until the hub has seen enough arrivals to know a tenant's cadence, use a
+// deliberately loose threshold. A tenant that legitimately pushes hourly must
+// not be declared stale on its first afternoon just because we cannot yet tell
+// it apart from a dead 5-minute tenant.
+const FRESHNESS_UNCALIBRATED_STALE_MS = 3 * 60 * 60 * 1000;
+// Clamps, so neither a pathologically fast cron nor a pathologically slow one
+// produces a threshold that is useless in practice.
+const FRESHNESS_MIN_STALE_MS = 15 * 60 * 1000;
+const FRESHNESS_MAX_STALE_MS = 6 * 60 * 60 * 1000;
+const FRESHNESS_MIN_GAPS = 3;
+
+type Freshness = {
+  age_ms: number | null;
+  stale: boolean;
+  stale_after_ms: number;
+  expected_interval_ms: number | null;
+  calibrated: boolean;
+};
+
+// The cadence is the MEDIAN observed gap, never the mean: one missed run
+// doubles a single gap, and a mean would quietly raise the alarm threshold at
+// exactly the moment it should be tightening.
+function deriveExpectedInterval(gapsMs: unknown): number | null {
+  const usable = (Array.isArray(gapsMs) ? gapsMs : [])
+    .map((g) => Number(g))
+    .filter((g) => isFinite(g) && g > 0);
+  if (usable.length < FRESHNESS_MIN_GAPS) return null;
+  const sorted = usable.sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+function staleAfterMs(expectedIntervalMs: number | null): number {
+  if (expectedIntervalMs === null) return FRESHNESS_UNCALIBRATED_STALE_MS;
+  const threshold = expectedIntervalMs * FRESHNESS_MISSED_PUSHES;
+  return Math.min(FRESHNESS_MAX_STALE_MS, Math.max(FRESHNESS_MIN_STALE_MS, threshold));
+}
+
+// `receivedAt` of 0/absent means the hub holds a row it never actually received
+// a push for — that is maximally stale, not brand new.
+function assessFreshness(receivedAt: unknown, gapsMs: unknown, now: number): Freshness {
+  const received = Number(receivedAt);
+  const expected = deriveExpectedInterval(gapsMs);
+  const staleAfter = staleAfterMs(expected);
+  const known = isFinite(received) && received > 0;
+  return {
+    age_ms: known ? now - received : null,
+    stale: known ? now - received > staleAfter : true,
+    stale_after_ms: staleAfter,
+    expected_interval_ms: expected,
+    calibrated: expected !== null,
+  };
+}
+
+// Freshness GATES the snapshot's severity instead of rolling up with it.
+// worstSeverity would be wrong here: a stale snapshot's judgement is stale too,
+// so "sev2 as of four hours ago" must not keep a tile red any more than
+// "healthy as of four hours ago" may keep it green. Once a tenant goes quiet we
+// do not know its state, and `unknown` is precisely that claim. This is the
+// whole of "silence is not health" — everything else about freshness is
+// plumbing.
+function gateSeverityOnFreshness(snapshotSeverity: OpsSeverity, freshness: Freshness): OpsSeverity {
+  return freshness.stale ? "unknown" : snapshotSeverity;
+}
+
+// A stale tenant's human-readable line. Says how late it is AND what was
+// expected, because "43m ago" is only alarming if you know the tenant pushes
+// every 5 minutes.
+function staleMessage(freshness: Freshness): string {
+  const mins = (ms: number) => `${Math.round(ms / 60000)}m`;
+  const age = freshness.age_ms === null ? "never" : `${mins(freshness.age_ms)} ago`;
+  const basis = freshness.calibrated
+    ? `expected every ${mins(freshness.expected_interval_ms as number)}`
+    : `cadence not yet established, allowing ${mins(freshness.stale_after_ms)}`;
+  return `stale: last push ${age} (${basis})`;
 }
 
 // The tenant framework has never fired, so its non-"none" vocabulary is
