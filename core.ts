@@ -340,6 +340,17 @@ function classifyAgentLatency(avgMs: number | null): OpsSeverity {
 // counts, so a busy agent isn't penalised for volume.
 function classifyTagRates(tags: TagCounts, interactions: number): OpsSeverity {
   if (!interactions || interactions <= 0) return "unknown";
+  // A tenant that does not follow the error_/warning_/info_ convention has NO
+  // prefixed tags at all. Its error rate then computes as exactly 0%, and this
+  // function used to answer "ok" — green, off a convention the tenant never
+  // adopted. That is the honesty rule's failure mode wearing a different hat:
+  // not a failed read, but an inapplicable measurement reported as health.
+  //
+  // Checked against real data (2026-07-30): Eventim DOES use the convention —
+  // 3 error_ tags and 1 info_ among 31 — so its 0.20% error rate is a genuine
+  // ok. Without this guard a tenant with 31 unprefixed tags would have been
+  // indistinguishable from Eventim's clean result.
+  if (tags.error + tags.warning + tags.info === 0) return "unknown";
   const errPct = (tags.error / interactions) * 100;
   const warnPct = (tags.warning / interactions) * 100;
   if (errPct >= ERROR_TAG_RATE_SEV2_PCT) return "sev2";
@@ -831,7 +842,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
   const issuesRange = window.start !== null && window.end !== null ? `&startDate=${window.start}&endDate=${window.end}` : "";
   const alertsRange = window.start !== null && window.end !== null ? `&start_date=${window.start}&end_date=${window.end}` : "";
 
-  const [issues, incidents, commsWindow, issuesWindow, alertsWindow, monitorsRaw, agentNameById, business, perAgent] =
+  const [issues, incidents, commsWindow, issuesWindow, alertsWindow, monitorsRaw, agentNameById, business, perAgent, serviceHealth, toolLatency] =
     await Promise.all([
       getList(baseUrl, apiKey, `/api/v1/issues?filters=${EMPTY_FILTERS}&limit=1000`),
       getList(baseUrl, apiKey, `/api/v1/alerts/incidents?filters=${EMPTY_FILTERS}&limit=1000&withPreloads=true`),
@@ -842,7 +853,23 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
       fetchAgentNames(baseUrl, apiKey),
       fetchBusinessMetrics(baseUrl, apiKey, window),
       fetchPerAgentKpis(baseUrl, apiKey, window),
+      // Technical-ops facts. All five queries below were verified against live
+      // Eventim data on 2026-07-30 — before this, none had ever been executed,
+      // and on FDE (empty /stats, zero latency rows) a wrong entity or column
+      // name would have been indistinguishable from "no data".
+      //
+      // fetchDetectorVerdicts is deliberately NOT called. The table exists and
+      // its framework is running, but every group_by dimension comes back null
+      // through /api/v2/query/aggregate — custom-table columns are not
+      // groupable that way. mapDetectorSeverity then scores the empty result
+      // "ok", i.e. it would render GREEN off data we cannot read. It needs the
+      // rows API (403 for service accounts) or another path first.
+      fetchServiceHealth(baseUrl, apiKey),
+      fetchToolLatency(baseUrl, apiKey, window),
     ]);
+
+  // Needs agentNameById, so it cannot join the batch above.
+  const agentTech = await fetchAgentTechSignals(baseUrl, apiKey, window, agentNameById);
 
   const openIssues = issues.items.filter(isOpenIssue).length;
   const openIncidents = incidents.items.filter(isOpenAlert);
@@ -871,6 +898,12 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
   if (commsWindow.error) errors.push(`interactions: ${commsWindow.error}`);
   if (business.error) errors.push(`business_metrics: ${business.error}`);
   if (perAgent.error) errors.push(`per_agent_kpis: ${perAgent.error}`);
+  // A tech-ops read that failed must surface as a gap, not vanish. `available:
+  // false` on service health already means "unreadable"; the message is what
+  // makes it diagnosable from the run log.
+  if (serviceHealth.error) errors.push(`service_health: ${serviceHealth.error}`);
+  if (toolLatency.error) errors.push(`tool_latency: ${toolLatency.error}`);
+  for (const e of agentTech.errors) errors.push(e);
 
   return {
     name,
@@ -886,6 +919,13 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     monitors_by_agent: monitorAggregation.byAgent,
     business_metrics: business.metrics,
     agents,
+    // Technical-ops facts, never verdicts — the consumer classifies these. Note
+    // `service_health` carries its own `available` flag rather than being
+    // omitted when unreadable: absent and unreadable must stay distinguishable,
+    // because only one of them means "we asked and could not tell".
+    service_health: serviceHealth,
+    agent_tech: agentTech.agents,
+    tool_latency: { by_tool: toolLatency.byTool, trend: toolLatency.trend },
     ...(errors.length ? { errors } : {}),
   };
 }
