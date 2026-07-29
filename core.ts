@@ -202,6 +202,46 @@ function aggregateMonitors(monitors: MonitorDetail[]) {
   return { bySeverity, byAgent };
 }
 
+// --- Per-signal severity ----------------------------------------------------
+// One classifier per signal, so the same threshold answers both questions a
+// dashboard asks: "how is this tenant?" (the worst-of rollup, which colours a
+// tile) and "which signal is bad?" (the per-signal list, which colours the tile
+// that explains it). Stating a threshold twice for those two purposes would let
+// a tenant's colour and its own detail tiles disagree about the very numbers
+// they were both derived from.
+//
+// Each takes `unknown` rather than `number` on purpose. A count that never
+// arrived — projected away by a T0/T1 tier, or lost to a failed read — is not
+// zero. Reading a missing count as 0 and returning `ok` is exactly the lie the
+// honesty rule exists to prevent, and it is a lie that renders green.
+
+function classifyActiveAlerts(activeAlerts: unknown): OpsSeverity {
+  if (typeof activeAlerts !== "number" || !isFinite(activeAlerts)) return "unknown";
+  return activeAlerts > 0 ? "sev2" : "ok";
+}
+
+function classifyOpenIssues(openIssues: unknown): OpsSeverity {
+  if (typeof openIssues !== "number" || !isFinite(openIssues)) return "unknown";
+  return openIssues > 0 ? "sev3" : "ok";
+}
+
+// Coverage as a signal in its own right, not only as a gate on other signals.
+// Any failed read means the picture is incomplete, which is precisely what grey
+// claims — so only a clean read is green. Deliberately NOT a health severity: an
+// unreadable metrics endpoint is our measurement problem, not the tenant
+// misbehaving, and scoring it sev3 would put a tenant under investigation for
+// our own gap.
+function classifyDataCompleteness(failedReadCount: unknown): OpsSeverity {
+  if (typeof failedReadCount !== "number" || !isFinite(failedReadCount)) return "unknown";
+  return failedReadCount === 0 ? "ok" : "unknown";
+}
+
+// Freshness as a signal in its own right. gateSeverityOnFreshness applies the
+// same verdict to the OTHER signals; this is the tile that says why they greyed.
+function classifyFreshness(freshness: Freshness): OpsSeverity {
+  return freshness.stale ? "unknown" : "ok";
+}
+
 // Business severity. Still a PLACEHOLDER threshold set — the business half of
 // the severity decision is open — but it now speaks the single OpsSeverity
 // scale instead of a second, parallel vocabulary.
@@ -210,11 +250,14 @@ function aggregateMonitors(monitors: MonitorDetail[]) {
 // misleading, so report unknown. A failure in a non-health read (e.g. business
 // metrics) does NOT force this; the alerts/issues signal is still valid and the
 // partial-data errors are surfaced anyway.
+//
+// Composed from the per-signal classifiers above rather than restating their
+// thresholds, so the rollup and the signal list can never disagree. Behaviour is
+// unchanged: alerts sev2 outranks issues sev3 under worstSeverity exactly as the
+// old early-return order did.
 function classifyBusiness(activeAlerts: number, openIssues: number, healthUnknown = false): OpsSeverity {
   if (healthUnknown) return "unknown";
-  if (activeAlerts > 0) return "sev2";
-  if (openIssues > 0) return "sev3";
-  return "ok";
+  return worstSeverity(classifyActiveAlerts(activeAlerts), classifyOpenIssues(openIssues));
 }
 
 // The ONE adapter between a snapshot's severity string and the ops scale.
