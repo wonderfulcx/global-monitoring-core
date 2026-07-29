@@ -220,12 +220,17 @@ function classifyBusiness(activeAlerts: number, openIssues: number, healthUnknow
 // Payloads from a tenant still on an older pusher (or at T0/T1, where raw
 // detail may not leave and the source pre-computes) carry the legacy
 // critical/attention/healthy vocabulary. Translate rather than keep two scales.
+// Maps to whatever classifyBusiness would score from the SAME inputs, not one
+// level hotter: legacy `critical` meant activeAlerts > 0 (sev2 today) and
+// `attention` meant openIssues > 0 (sev3). Mapping critical→sev1 would escalate
+// every tenant the moment the reader ships. Kept in step with the app's
+// normalizeSeverity — if one changes, change both.
 function legacySeverityToOps(raw: unknown): OpsSeverity {
   switch (String(raw ?? "").trim().toLowerCase()) {
     case "critical":
-      return "sev1";
-    case "attention":
       return "sev2";
+    case "attention":
+      return "sev3";
     case "healthy":
       return "ok";
     default:
@@ -451,6 +456,222 @@ async function fetchPerAgentKpis(
   } catch (e) {
     return { agents: [], error: (e as Error).message ?? String(e) };
   }
+}
+
+// --- Technical-ops collectors -------------------------------------------------
+// These run on the PRODUCER (the tenant's own cron) because only the tenant's
+// token can read the tenant. They return facts and never decide severity — the
+// classify*/rollup* functions above do that, in the consumer.
+//
+// Everything here goes through ONE endpoint, /api/v2/query/aggregate, which the
+// canonical 7-permission monitoring role already covers (verified 2026-07-28).
+
+type AggRow = { value?: unknown; dimensions?: Record<string, unknown>; key?: unknown };
+
+// The aggregate response nests as { data: { data: [...] } }; tolerate the
+// shallower shapes too rather than assuming one.
+async function aggregateQuery(
+  baseUrl: string,
+  apiKey: string,
+  body: Record<string, unknown>,
+): Promise<{ rows: AggRow[]; error?: string }> {
+  try {
+    const raw = (await apiCall(baseUrl, `/api/v2/query/aggregate`, apiKey, {
+      method: "POST",
+      body: JSON.stringify(body),
+    })) as Record<string, unknown>;
+    const outer = (raw?.data ?? raw) as Record<string, unknown> | unknown[] | undefined;
+    const rows = Array.isArray(outer) ? outer : ((outer as Record<string, unknown>)?.data as unknown[]) ?? [];
+    return { rows: rows as AggRow[] };
+  } catch (e) {
+    return { rows: [], error: (e as Error).message ?? String(e) };
+  }
+}
+
+const dimStr = (r: AggRow, key: string): string => String(r.dimensions?.[key] ?? r.key ?? "");
+const rowNum = (r: AggRow): number => (typeof r.value === "number" ? r.value : Number(r.value ?? 0) || 0);
+const withRange = (body: Record<string, unknown>, w: TimeWindow) =>
+  w.start !== null && w.end !== null ? { ...body, time_range: { start: w.start, end: w.end } } : body;
+
+// Per-agent service health. This is the Sev1 signal: "/stats all good, otherwise
+// Sev1". The response is keyed by agent id, each with a status plus a per-service
+// map (llm, stt, tts, rag, sms, noise_cancellation, gender_classification).
+// NOTE: `available: false` means we could not read it — that is unknown, never ok.
+async function fetchServiceHealth(baseUrl: string, apiKey: string): Promise<ServiceHealth> {
+  try {
+    const raw = (await apiCall(baseUrl, `/api/v1/stats`, apiKey)) as Record<string, unknown>;
+    const body = (raw?.data ?? raw) as Record<string, unknown>;
+    const agents: AgentServiceHealth[] = [];
+    for (const [agentId, value] of Object.entries(body ?? {})) {
+      const entry = value as { status?: unknown; services?: Record<string, { status?: unknown }> } | null;
+      if (!entry || typeof entry !== "object") continue;
+      const unhealthy = Object.entries(entry.services ?? {})
+        .filter(([, s]) => String(s?.status ?? "").toLowerCase() !== "healthy")
+        .map(([serviceName]) => serviceName);
+      agents.push({ agent_id: agentId, status: String(entry.status ?? "unknown"), unhealthy_services: unhealthy });
+    }
+    const unhealthyCount = agents.filter(
+      (a) => a.unhealthy_services.length > 0 || a.status.toLowerCase() !== "healthy",
+    ).length;
+    return { available: true, agents, unhealthy_count: unhealthyCount };
+  } catch (e) {
+    return { available: false, agents: [], unhealthy_count: 0, error: (e as Error).message ?? String(e) };
+  }
+}
+
+// error_/warning_/info_ prefixes are the tenant's own convention (the platform's
+// tags_category is only General/Workflow, which carries no severity). A tenant
+// that doesn't follow it simply reports zeros, which classifyTagRates reads as
+// "no signal" rather than "healthy".
+function classifyTagName(tag: string): keyof TagCounts {
+  const t = tag.toLowerCase();
+  if (t.startsWith("error_")) return "error";
+  if (t.startsWith("warning_")) return "warning";
+  if (t.startsWith("info_")) return "info";
+  return "other";
+}
+
+// Per-agent technical signals: average agent latency, and tag counts bucketed by
+// prefix. Interactions per agent come along because tag RATES need a denominator
+// ("Tag Rate instead of Tag Count").
+async function fetchAgentTechSignals(
+  baseUrl: string,
+  apiKey: string,
+  window: TimeWindow,
+  agentNameById: Map<string, string>,
+): Promise<{ agents: AgentTechSignals[]; errors: string[] }> {
+  const [latency, tags, volume] = await Promise.all([
+    aggregateQuery(
+      baseUrl,
+      apiKey,
+      withRange({ entity: "interactions", aggregation: { type: "avg", column: "agent_latency" }, group_by: ["agent_id"], limit: 200 }, window),
+    ),
+    aggregateQuery(
+      baseUrl,
+      apiKey,
+      withRange({ entity: "interactions", aggregation: { type: "count" }, group_by: ["agent_id", "tags"], limit: 1000 }, window),
+    ),
+    aggregateQuery(
+      baseUrl,
+      apiKey,
+      withRange({ entity: "interactions", aggregation: { type: "count" }, group_by: ["agent_id"], limit: 200 }, window),
+    ),
+  ]);
+
+  const byAgent = new Map<string, AgentTechSignals>();
+  const ensure = (agentId: string): AgentTechSignals => {
+    let entry = byAgent.get(agentId);
+    if (!entry) {
+      entry = {
+        agent_id: agentId,
+        agent_name: agentNameById.get(agentId) ?? agentId,
+        agent_latency_ms: null,
+        tag_counts: { error: 0, warning: 0, info: 0, other: 0 },
+        interactions: 0,
+      };
+      byAgent.set(agentId, entry);
+    }
+    return entry;
+  };
+
+  for (const r of latency.rows) {
+    const v = rowNum(r);
+    ensure(dimStr(r, "agent_id")).agent_latency_ms = Number.isFinite(v) ? Math.round(v) : null;
+  }
+  for (const r of volume.rows) ensure(dimStr(r, "agent_id")).interactions = rowNum(r);
+  for (const r of tags.rows) {
+    const tag = String(r.dimensions?.tags ?? "");
+    if (!tag) continue;
+    ensure(dimStr(r, "agent_id")).tag_counts[classifyTagName(tag)] += rowNum(r);
+  }
+
+  const errors: string[] = [];
+  for (const [label, r] of [
+    ["agent_latency", latency],
+    ["agent_tags", tags],
+    ["agent_volume", volume],
+  ] as [string, { error?: string }][])
+    if (r.error) errors.push(`${label}: ${r.error}`);
+
+  return { agents: [...byAgent.values()].sort((a, b) => a.agent_name.localeCompare(b.agent_name)), errors };
+}
+
+// Average latency per tool, plus a daily trend. The trend is what makes "tool
+// call latency INCREASED" answerable — a single number can only say "high".
+async function fetchToolLatency(
+  baseUrl: string,
+  apiKey: string,
+  window: TimeWindow,
+): Promise<{ byTool: NamedAvg[]; trend: SeriesPoint[]; error?: string }> {
+  const [perTool, daily] = await Promise.all([
+    aggregateQuery(
+      baseUrl,
+      apiKey,
+      withRange({ entity: "tools", aggregation: { type: "avg", column: "tool_latency_ms" }, group_by: ["tool_name"], limit: 100 }, window),
+    ),
+    aggregateQuery(
+      baseUrl,
+      apiKey,
+      withRange(
+        { entity: "tools", aggregation: { type: "avg", column: "tool_latency_ms" }, group_by: ["recorded_at"], date_granularity: "day", limit: 60 },
+        window,
+      ),
+    ),
+  ]);
+  const byTool = perTool.rows
+    .map((r) => ({ key: dimStr(r, "tool_name"), avg_ms: Math.round(rowNum(r)) }))
+    .filter((t) => t.key)
+    .sort((a, b) => b.avg_ms - a.avg_ms);
+  const trend = daily.rows
+    .map((r) => ({ at: dimStr(r, "recorded_at"), value: Math.round(rowNum(r)) }))
+    .filter((p) => p.at)
+    .sort((a, b) => a.at.localeCompare(b.at));
+  const error = perTool.error ?? daily.error;
+  return { byTool, trend, ...(error ? { error } : {}) };
+}
+
+// The tenant's OWN monitoring framework already computes baselines, opening
+// hours and known-event normalisation. We consume its latest verdicts; we do not
+// recompute any of that.
+//
+// It must be read through the query layer: service accounts get 403 on
+// /api/v1/custom-tables/<name>/rows, but `custom_table:<name>` via aggregate is
+// permitted. That returns aggregates rather than rows, so "latest verdict per
+// agent per detector" is obtained by grouping over a narrow recent window — one
+// detector cycle yields one row per (agent, detector).
+const DETECTOR_TABLE = "custom_table:tenant_monitoring_agent_detector_runs";
+const DETECTOR_LOOKBACK_MS = 30 * 60 * 1000;
+
+async function fetchDetectorVerdicts(baseUrl: string, apiKey: string, now: number): Promise<DetectorFeed> {
+  const { rows, error } = await aggregateQuery(baseUrl, apiKey, {
+    entity: DETECTOR_TABLE,
+    aggregation: { type: "count" },
+    group_by: ["agent_name", "detector", "severity", "status", "would_notify"],
+    limit: 200,
+    time_range: { start: now - DETECTOR_LOOKBACK_MS, end: now },
+  });
+  // A tenant without the framework 404s here. That is not an error condition —
+  // it means we cannot judge its technical health, i.e. unknown, not green.
+  if (error) return { available: false, verdicts: [], undetermined: 0, error };
+
+  const verdicts: DetectorVerdict[] = rows.map((r) => {
+    const rawSeverity = String(r.dimensions?.severity ?? "");
+    const status = String(r.dimensions?.status ?? "");
+    const wouldNotify = r.dimensions?.would_notify;
+    return {
+      detector: String(r.dimensions?.detector ?? ""),
+      agent_name: String(r.dimensions?.agent_name ?? ""),
+      severity: mapDetectorSeverity(rawSeverity, status, wouldNotify),
+      raw_severity: rawSeverity,
+      status,
+      would_notify: wouldNotify === true || String(wouldNotify).toLowerCase() === "true",
+    };
+  });
+  return {
+    available: true,
+    verdicts,
+    undetermined: verdicts.filter((v) => v.severity === "unknown").length,
+  };
 }
 
 async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string | undefined, window: TimeWindow) {
