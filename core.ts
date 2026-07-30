@@ -442,7 +442,15 @@ function rollupIsPartial(r: { undetermined: number }): boolean {
 //
 // Both still render grey; the difference is whether they can hold a tenant back
 // from green.
-type NoVerdictReason = "unreadable" | "not_applicable";
+// Why a signal has no verdict. Three distinct situations that were all being
+// reported as "unreadable":
+//   unreadable      we asked and could not tell. Blocks green.
+//   not_applicable  nothing here to measure. Cannot block green.
+//   stale           the whole snapshot is too old, so this judgement is too.
+//                   ONE root cause, however many signals it gates — reporting it
+//                   per-signal turned a single late push into six independent
+//                   "unreadable" failures on the card.
+type NoVerdictReason = "unreadable" | "not_applicable" | "stale";
 
 // A determined problem outranks uncertainty — a tenant with a firing incident is
 // sev2, not "unknown because /stats was also unreadable". But `ok` plus an
