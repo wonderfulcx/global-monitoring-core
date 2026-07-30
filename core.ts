@@ -220,6 +220,36 @@ function classifyActiveAlerts(activeAlerts: unknown): OpsSeverity {
   return activeAlerts > 0 ? "sev2" : "ok";
 }
 
+// The tenant's own monitor already graded each incident High/Medium/Low, and we
+// collected that grade into AlertDetail — then scored every open incident sev2
+// regardless, so a Low-severity incident and a High one painted the same colour.
+// This uses the grade we already have.
+//
+// The mapping respects the tenant's judgement rather than re-deriving it: they
+// called it High, so it is our Sev1. `Unknown` grades fall back to sev2, the
+// old blanket answer, because an ungraded firing incident must not read as
+// milder than a graded one.
+const INCIDENT_SEVERITY: Record<AlertSeverity, OpsSeverity> = {
+  High: "sev1",
+  Medium: "sev2",
+  Low: "sev3",
+  Unknown: "sev2",
+};
+
+// `details` is only present at T3. A T1/T2 tenant sends the count but not the
+// grades, so it keeps the count-based answer — a coarser verdict from the same
+// facts, never a wrong one.
+function classifyIncidents(activeAlerts: unknown, details: unknown): OpsSeverity {
+  const byCount = classifyActiveAlerts(activeAlerts);
+  if (!Array.isArray(details) || details.length === 0) return byCount;
+  const graded = (details as AlertDetail[])
+    .filter((d) => d && typeof d === "object")
+    .map((d) => INCIDENT_SEVERITY[normalizeSeverity(d.severity)]);
+  if (graded.length === 0) return byCount;
+  // Worst-of: one High incident among ten Lows is still a High.
+  return worstSeverity(...graded);
+}
+
 function classifyOpenIssues(openIssues: unknown): OpsSeverity {
   if (typeof openIssues !== "number" || !isFinite(openIssues)) return "unknown";
   return openIssues > 0 ? "sev3" : "ok";
@@ -339,9 +369,106 @@ function rollupWithCoverage(vals: OpsSeverity[]): { severity: OpsSeverity; undet
   return { severity: worstSeverity(...determined), undetermined };
 }
 
+// --- Health vs. measurement confidence ---------------------------------------
+// `unknown` was doing two incompatible jobs, and the collision produced a real
+// bug: rollupWithCoverage drops every unknown, so a tenant whose /stats could not
+// be read rendered GREEN with a small "1 undetermined" note beside it. Verified
+// on FDE 2026-07-30 — two of seven signals undetermined, tile green. That is the
+// honesty rule inverted, and a test asserted it as correct.
+//
+// The two jobs:
+//   UNREADABLE      we asked and could not tell. Uncertainty about health.
+//                   Must never be reported as health.
+//   NOT_APPLICABLE  there is nothing to measure here. The tenant does not use
+//                   the error_/warning_ tag convention, has no evaluated
+//                   metrics, and so on. Absence of a subject, not absence of an
+//                   answer — it cannot make a tenant look worse.
+//
+// Both still render grey; the difference is whether they can hold a tenant back
+// from green.
+type NoVerdictReason = "unreadable" | "not_applicable";
+
+// A determined problem outranks uncertainty — a tenant with a firing incident is
+// sev2, not "unknown because /stats was also unreadable". But `ok` plus an
+// unreadable signal is not ok: it is unknown, which is precisely the claim we can
+// defend.
+function applyConfidence(worst: OpsSeverity, unreadableCount: number): OpsSeverity {
+  return worst === "ok" && unreadableCount > 0 ? "unknown" : worst;
+}
+
 function classifyAgentLatency(avgMs: number | null): OpsSeverity {
   if (avgMs === null || !isFinite(avgMs)) return "unknown";
   return avgMs > AGENT_LATENCY_RED_MS ? "sev2" : "ok";
+}
+
+// --- Comparison against an agent's own normal --------------------------------
+// The absolute rule above answers "is this bad?" with a number somebody guessed.
+// This answers "is this unusual FOR THIS AGENT?" using only the agent's own
+// history, which is the difference between a threshold that transfers between
+// tenants and one that has to be re-guessed for each.
+//
+// No storage. The comparison periods are the SAME window shifted back, so a
+// 28-day baseline is available on the first run instead of accumulating for a
+// month. (The alternative — group_by [agent_id, recorded_at] with
+// date_granularity — 500s on the interactions entity; verified 2026-07-30. The
+// day_of_week/time_of_day dimensions do work, but time_of_day is per-MINUTE, so
+// a 28-day window blows the 1000-row limit before it covers one agent.)
+
+const BASELINE_PERIODS = 3; // prior windows to compare against
+const BASELINE_MIN_PERIODS = 3; // fewer than this and there is no baseline
+// A rise must clear BOTH gates. MAD alone is unusable at this sample size:
+// Eventim's Schwerbi Hotline has priors [1752, 1712, 1709] ms, giving a MAD of
+// 3 ms and a +3-MAD band of 1721 ms — so a perfectly ordinary 1967 ms reading
+// would flag. The relative gate is what makes the band survive low variance.
+const BASELINE_MAD_K = 3;
+const BASELINE_MIN_RISE_PCT = 25;
+
+// Same window, shifted back N periods. Unbounded windows ("all") have no
+// previous period, so they get no baseline rather than a fabricated one.
+function shiftWindow(w: TimeWindow, periodsBack: number): TimeWindow | null {
+  if (w.start === null || w.end === null) return null;
+  const span = w.end - w.start;
+  if (span <= 0) return null;
+  const shift = span * periodsBack;
+  return { range: w.range, start: w.start - shift, end: w.end - shift, label: `${w.label} −${periodsBack}` };
+}
+
+function median(nums: number[]): number | null {
+  const s = nums.filter((n) => isFinite(n)).sort((a, b) => a - b);
+  if (s.length === 0) return null;
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Median absolute deviation — the spread measure that survives an outlier, where
+// a standard deviation would be dragged by the very spike we are looking for.
+function medianAbsoluteDeviation(nums: number[], med: number): number {
+  return median(nums.map((n) => Math.abs(n - med))) ?? 0;
+}
+
+type Deviation = {
+  severity: OpsSeverity;
+  rise_pct: number | null;
+  baseline_ms: number | null;
+  periods: number;
+};
+
+// Only a RISE is reported. For latency a fall is good news, and reporting it as
+// a deviation would put a tile on screen that nobody should act on.
+function classifyLatencyTrend(current: number | null, priors: number[]): Deviation {
+  const usable = priors.filter((n) => typeof n === "number" && isFinite(n) && n > 0);
+  const none = { severity: "unknown" as OpsSeverity, rise_pct: null, baseline_ms: null, periods: usable.length };
+  if (current === null || !isFinite(current)) return none;
+  if (usable.length < BASELINE_MIN_PERIODS) return none;
+  const med = median(usable);
+  if (med === null || med <= 0) return none;
+
+  const risePct = Math.round(((current - med) / med) * 1000) / 10;
+  const band = med + BASELINE_MAD_K * medianAbsoluteDeviation(usable, med);
+  // sev3 — "needs investigation", per the framework's outlier-prediction level.
+  // A deviation is not an outage; it is the leading signal before one.
+  const outlier = risePct >= BASELINE_MIN_RISE_PCT && current > band;
+  return { severity: outlier ? "sev3" : "ok", rise_pct: risePct, baseline_ms: Math.round(med), periods: usable.length };
 }
 
 // error_* tags are sev2, warning_* sev3 — per the L1 severity note. Rates, not
