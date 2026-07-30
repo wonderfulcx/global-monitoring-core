@@ -280,10 +280,22 @@ function classifyIncidents(activeAlerts: unknown, bySeverity: unknown): OpsSever
   return worstSeverity(...graded);
 }
 
-function classifyOpenIssues(openIssues: unknown): OpsSeverity {
-  if (typeof openIssues !== "number" || !isFinite(openIssues)) return "unknown";
-  return openIssues > 0 ? "sev3" : "ok";
-}
+// classifyOpenIssues is GONE, deliberately. Colour means "someone should act",
+// and an open-issue backlog is not an action item — it is a work queue. Eventim
+// has sat at 112-117 open issues for the whole rollout, so "over zero -> sev3"
+// painted a permanent orange that told an operator nothing and trained them to
+// ignore the colour. The tenant's own dashboard shows the same number as a plain
+// count, which is the correct treatment.
+//
+// Open issues, issues opened, interactions, alerts fired and tool latency are all
+// CONTEXT: shown as numbers, never coloured. Only signals a human should respond
+// to now carry a status — a fired incident, a dead service, latency past the
+// ceiling, an error-tag rate, and the two trust gates.
+//
+// If issues ever earn a status it will not be from the total. The API exposes a
+// per-issue `severity` (Eventim: 23 at sev 1, 73 at 2, 19 at 3, 2 at 4) and a
+// `category` (42 wrong_answer, 28 tool_failure), so a rule would be built from
+// those — a different function, not this one.
 
 // Coverage as a signal in its own right, not only as a gate on other signals.
 // Any failed read means the picture is incomplete, which is precisely what grey
@@ -315,9 +327,13 @@ function classifyFreshness(freshness: Freshness): OpsSeverity {
 // thresholds, so the rollup and the signal list can never disagree. Behaviour is
 // unchanged: alerts sev2 outranks issues sev3 under worstSeverity exactly as the
 // old early-return order did.
-function classifyBusiness(activeAlerts: number, openIssues: number, healthUnknown = false): OpsSeverity {
+function classifyBusiness(activeAlerts: number, healthUnknown = false): OpsSeverity {
   if (healthUnknown) return "unknown";
-  return worstSeverity(classifyActiveAlerts(activeAlerts), classifyOpenIssues(openIssues));
+  // Open issues were part of this and no longer are, for the same reason they no
+  // longer colour a tile. Leaving them here would have kept the PRODUCER's claimed
+  // severity permanently orange, and the hub honoured that claim — so removing the
+  // signal from the reader alone would not have changed a single tile.
+  return classifyActiveAlerts(activeAlerts);
 }
 
 // The ONE adapter between a snapshot's severity string and the ops scale.
@@ -1135,7 +1151,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     open_issues: openIssues,
     active_alerts: activeAlerts,
     active_alerts_by_severity: activeAlertsBySeverity,
-    severity: classifyBusiness(activeAlerts, openIssues, !!(issues.error || incidents.error)),
+    severity: classifyBusiness(activeAlerts, !!(issues.error || incidents.error)),
     alerts: alertDetails,
     monitors,
     monitors_by_severity: monitorAggregation.bySeverity,
