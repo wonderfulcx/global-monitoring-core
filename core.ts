@@ -245,15 +245,32 @@ const INCIDENT_SEVERITY: Record<AlertSeverity, OpsSeverity> = {
 // active_alerts_by_severity — four integers, no names, no timestamps, safe at T1 —
 // and the mapping happens here.
 function classifyIncidents(activeAlerts: unknown, bySeverity: unknown): OpsSeverity {
+  const byCount = classifyActiveAlerts(activeAlerts);
   const c = bySeverity as Partial<Record<AlertSeverity, unknown>> | null | undefined;
-  if (!c || typeof c !== "object") return classifyActiveAlerts(activeAlerts);
+  // Array.isArray is not paranoia — it is the bug that shipped. The hub passed the
+  // T3 detail LIST where this expects the count vector; an array is `typeof
+  // "object"`, so `Number(arr["High"])` gave NaN, every bucket read 0, the total
+  // read 0, and one open High incident classified as `ok`. A green tile for a
+  // firing incident. Anything that is not a plain object now falls back to the
+  // count instead of being silently misread as "nothing is firing".
+  if (!c || typeof c !== "object" || Array.isArray(c)) return byCount;
+
   const n = (k: AlertSeverity): number => {
     const v = Number(c[k]);
     return isFinite(v) && v > 0 ? v : 0;
   };
   const total = n("High") + n("Medium") + n("Low") + n("Unknown");
-  // A vector of zeros is a real answer: nothing is firing.
-  if (total === 0) return classifyActiveAlerts(activeAlerts) === "unknown" ? "unknown" : "ok";
+  const count = typeof activeAlerts === "number" && isFinite(activeAlerts) ? activeAlerts : null;
+
+  // The vector must agree with the count it summarises. If it does not, one of the
+  // two is wrong and we cannot tell which — so take the coarser answer rather than
+  // trust a vector claiming nothing fires while the count says otherwise. Without
+  // this, {count: 1, all grades 0} returned `ok`.
+  if (count !== null && total !== count) return byCount;
+  // A vector of zeros agreeing with a count of zero is a real answer: nothing is
+  // firing. byCount already says `ok` for 0 and `unknown` when the count is absent.
+  if (total === 0) return byCount;
+
   const graded: OpsSeverity[] = [];
   if (n("High") > 0) graded.push(INCIDENT_SEVERITY.High);
   if (n("Medium") > 0) graded.push(INCIDENT_SEVERITY.Medium);
@@ -380,6 +397,16 @@ function rollupWithCoverage(vals: OpsSeverity[]): { severity: OpsSeverity; undet
   const undetermined = vals.length - determined.length;
   if (determined.length === 0) return { severity: vals.length ? "unknown" : "unknown", undetermined };
   return { severity: worstSeverity(...determined), undetermined };
+}
+
+// Whether a rollup's own coverage was complete. `rollupWithCoverage` returns
+// `{severity: "ok", undetermined: 1}` for [ok, unknown] — correct, but the caller
+// then built a signal whose severity was plainly `ok`, so the tenant-level check
+// (which looks only at severity) never learned an agent had been unreadable and
+// the tenant stayed green. Two agents fine and a third unreadable is not a fully
+// determined tenant.
+function rollupIsPartial(r: { undetermined: number }): boolean {
+  return r.undetermined > 0;
 }
 
 // --- Health vs. measurement confidence ---------------------------------------
