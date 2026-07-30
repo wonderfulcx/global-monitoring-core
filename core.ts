@@ -299,10 +299,20 @@ function normalizeOpsSeverity(raw: unknown): OpsSeverity {
 // redeployed to every tenant. They live here only because core.ts is the one
 // file both plugins inline.
 
-// Latency thresholds, from the L1 note ("normally 1 second … Sev1 if more than
-// 3 seconds"). Tunable — changing these re-colours history, by design.
-const AGENT_LATENCY_SEV1_MS = 3000;
-const AGENT_LATENCY_SEV2_MS = 2000;
+// ONE latency line, at 3 seconds. Tunable — changing it re-colours history, by
+// design.
+//
+// There used to be two (sev1 over 3000 ms, sev2 over 2000 ms) and the 2000 ms
+// tier was wrong in a way only real data showed. Eventim's Schwerbi Hotline
+// averages 1891–2094 ms depending on the window, so it sat astride the line: red
+// on the current week, green on last-7, flipping with the range selector while
+// nothing about the agent changed. A threshold inside normal variation produces a
+// colour that is permanently on, and a colour that never changes trains you to
+// ignore it — the same defect as scoring a 115-issue backlog "over zero → orange".
+//
+// So: over 3 seconds is red and worth attention; at or under it is green. No
+// intermediate tier, because we have no evidence for where one would go.
+const AGENT_LATENCY_RED_MS = 3000;
 // Tag rates are shares of interactions, not counts ("Tag Rate instead of Tag Count").
 const ERROR_TAG_RATE_SEV2_PCT = 1;
 const WARNING_TAG_RATE_SEV3_PCT = 5;
@@ -331,9 +341,7 @@ function rollupWithCoverage(vals: OpsSeverity[]): { severity: OpsSeverity; undet
 
 function classifyAgentLatency(avgMs: number | null): OpsSeverity {
   if (avgMs === null || !isFinite(avgMs)) return "unknown";
-  if (avgMs > AGENT_LATENCY_SEV1_MS) return "sev1";
-  if (avgMs > AGENT_LATENCY_SEV2_MS) return "sev2";
-  return "ok";
+  return avgMs > AGENT_LATENCY_RED_MS ? "sev2" : "ok";
 }
 
 // error_* tags are sev2, warning_* sev3 — per the L1 severity note. Rates, not
