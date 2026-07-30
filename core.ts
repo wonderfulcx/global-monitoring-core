@@ -236,17 +236,30 @@ const INCIDENT_SEVERITY: Record<AlertSeverity, OpsSeverity> = {
   Unknown: "sev2",
 };
 
-// `details` is only present at T3. A T1/T2 tenant sends the count but not the
-// grades, so it keeps the count-based answer — a coarser verdict from the same
-// facts, never a wrong one.
-function classifyIncidents(activeAlerts: unknown, details: unknown): OpsSeverity {
-  const byCount = classifyActiveAlerts(activeAlerts);
-  if (!Array.isArray(details) || details.length === 0) return byCount;
-  const graded = (details as AlertDetail[])
-    .filter((d) => d && typeof d === "object")
-    .map((d) => INCIDENT_SEVERITY[normalizeSeverity(d.severity)]);
-  if (graded.length === 0) return byCount;
-  // Worst-of: one High incident among ten Lows is still a High.
+// Classified from a COUNT VECTOR, not from the incident list.
+//
+// Reading the grades off `alerts[]` would have made severity depend on the
+// privacy tier: the same High incident scores sev1 at T3, where names and
+// timestamps travel, and sev2 at T1/T2, where they do not. A tenant's health must
+// not change because it discloses less. So the producer sends
+// active_alerts_by_severity — four integers, no names, no timestamps, safe at T1 —
+// and the mapping happens here.
+function classifyIncidents(activeAlerts: unknown, bySeverity: unknown): OpsSeverity {
+  const c = bySeverity as Partial<Record<AlertSeverity, unknown>> | null | undefined;
+  if (!c || typeof c !== "object") return classifyActiveAlerts(activeAlerts);
+  const n = (k: AlertSeverity): number => {
+    const v = Number(c[k]);
+    return isFinite(v) && v > 0 ? v : 0;
+  };
+  const total = n("High") + n("Medium") + n("Low") + n("Unknown");
+  // A vector of zeros is a real answer: nothing is firing.
+  if (total === 0) return classifyActiveAlerts(activeAlerts) === "unknown" ? "unknown" : "ok";
+  const graded: OpsSeverity[] = [];
+  if (n("High") > 0) graded.push(INCIDENT_SEVERITY.High);
+  if (n("Medium") > 0) graded.push(INCIDENT_SEVERITY.Medium);
+  if (n("Low") > 0) graded.push(INCIDENT_SEVERITY.Low);
+  if (n("Unknown") > 0) graded.push(INCIDENT_SEVERITY.Unknown);
+  // Worst-of: one High among ten Lows is still a High.
   return worstSeverity(...graded);
 }
 
@@ -423,13 +436,21 @@ const BASELINE_MIN_PERIODS = 3; // fewer than this and there is no baseline
 const BASELINE_MAD_K = 3;
 const BASELINE_MIN_RISE_PCT = 25;
 
-// Same window, shifted back N periods. Unbounded windows ("all") have no
-// previous period, so they get no baseline rather than a fabricated one.
+// How often a window RECURS, which is not the same as how long it lasts. The
+// business week spans 5 days (Mon 00:00 → Sat 00:00) but comes round every 7, so
+// shifting it by its own span lands on Wed–Mon: a different set of weekdays, with
+// a weekend in it. Comparing Mon–Fri traffic against Wed–Mon is not a comparison.
+// Unbounded windows ("all") have no previous period at all.
+function windowPeriodMs(w: TimeWindow): number | null {
+  if (w.range === "week" || w.range === "last7") return 7 * DAY_MS;
+  if (w.range === "last30") return 30 * DAY_MS;
+  return null;
+}
+
 function shiftWindow(w: TimeWindow, periodsBack: number): TimeWindow | null {
-  if (w.start === null || w.end === null) return null;
-  const span = w.end - w.start;
-  if (span <= 0) return null;
-  const shift = span * periodsBack;
+  const period = windowPeriodMs(w);
+  if (period === null || w.start === null || w.end === null) return null;
+  const shift = period * periodsBack;
   return { range: w.range, start: w.start - shift, end: w.end - shift, label: `${w.label} −${periodsBack}` };
 }
 
@@ -446,29 +467,64 @@ function medianAbsoluteDeviation(nums: number[], med: number): number {
   return median(nums.map((n) => Math.abs(n - med))) ?? 0;
 }
 
+// One period's reading: the mean AND how many interactions produced it. An
+// average over a single call is not comparable to an average over 620, and
+// without the count there is no way to tell them apart.
+type BaselinePoint = { avg_ms: number; interactions: number };
+
+// Below this, a period's mean is too thin to compare in either direction.
+const BASELINE_MIN_SAMPLE = 30;
+
 type Deviation = {
   severity: OpsSeverity;
   rise_pct: number | null;
   baseline_ms: number | null;
   periods: number;
+  // Why there is no verdict, when there is none — "insufficient_history" and
+  // "insufficient_sample" are very different problems to act on.
+  reason: "insufficient_history" | "insufficient_sample" | "no_current_reading" | null;
 };
 
 // Only a RISE is reported. For latency a fall is good news, and reporting it as
 // a deviation would put a tile on screen that nobody should act on.
-function classifyLatencyTrend(current: number | null, priors: number[]): Deviation {
-  const usable = priors.filter((n) => typeof n === "number" && isFinite(n) && n > 0);
-  const none = { severity: "unknown" as OpsSeverity, rise_pct: null, baseline_ms: null, periods: usable.length };
-  if (current === null || !isFinite(current)) return none;
-  if (usable.length < BASELINE_MIN_PERIODS) return none;
-  const med = median(usable);
-  if (med === null || med <= 0) return none;
+function classifyLatencyTrend(current: BaselinePoint | null, priors: BaselinePoint[]): Deviation {
+  const enough = (p: BaselinePoint | null | undefined): p is BaselinePoint =>
+    !!p && isFinite(p.avg_ms) && p.avg_ms > 0 && isFinite(p.interactions) && p.interactions >= BASELINE_MIN_SAMPLE;
 
-  const risePct = Math.round(((current - med) / med) * 1000) / 10;
-  const band = med + BASELINE_MAD_K * medianAbsoluteDeviation(usable, med);
-  // sev3 — "needs investigation", per the framework's outlier-prediction level.
-  // A deviation is not an outage; it is the leading signal before one.
-  const outlier = risePct >= BASELINE_MIN_RISE_PCT && current > band;
-  return { severity: outlier ? "sev3" : "ok", rise_pct: risePct, baseline_ms: Math.round(med), periods: usable.length };
+  const usable = (Array.isArray(priors) ? priors : []).filter(enough);
+  const none = (reason: Deviation["reason"]): Deviation => ({
+    severity: "unknown",
+    rise_pct: null,
+    baseline_ms: null,
+    periods: usable.length,
+    reason,
+  });
+
+  if (!current || !isFinite(current.avg_ms)) return none("no_current_reading");
+  // The current period is held to the same bar as the history it is compared to.
+  if (!enough(current)) return none("insufficient_sample");
+  if (usable.length < BASELINE_MIN_PERIODS) return none("insufficient_history");
+  const med = median(usable.map((p) => p.avg_ms));
+  if (med === null || med <= 0) return none("insufficient_history");
+
+  const risePct = Math.round(((current.avg_ms - med) / med) * 1000) / 10;
+  const band = med + BASELINE_MAD_K * medianAbsoluteDeviation(usable.map((p) => p.avg_ms), med);
+  // sev3 — "needs investigation". A deviation is not an outage; it is the leading
+  // signal before one.
+  //
+  // Deliberately NOT called anomaly detection. At three periods the MAD term
+  // contributes almost nothing (Eventim's priors give a 3 ms MAD), so the 25%
+  // relative gate does nearly all the work. The honest description of the output
+  // is "N% above the median of the previous 3 comparable periods" — which is what
+  // the tile should say.
+  const outlier = risePct >= BASELINE_MIN_RISE_PCT && current.avg_ms > band;
+  return {
+    severity: outlier ? "sev3" : "ok",
+    rise_pct: risePct,
+    baseline_ms: Math.round(med),
+    periods: usable.length,
+    reason: null,
+  };
 }
 
 // error_* tags are sev2, warning_* sev3 — per the L1 severity note. Rates, not
@@ -1010,6 +1066,10 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
   const openIncidents = incidents.items.filter(isOpenAlert);
   const activeAlerts = openIncidents.length;
   const alertDetails = openIncidents.map(toAlertDetail).sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+  // Four integers, no names and no timestamps, so this is safe to send at T1.
+  // It exists so incident severity does not depend on the disclosure tier.
+  const activeAlertsBySeverity = emptySeverityCounts();
+  for (const a of alertDetails) activeAlertsBySeverity[a.severity]++;
 
   const monitors = monitorsRaw.items
     .map((m) => toMonitorDetail(m, agentNameById))
@@ -1047,6 +1107,7 @@ async function fetchTenantStatus(name: string, baseUrl: string, apiKey: string |
     alerts_triggered: alertsWindow.total,
     open_issues: openIssues,
     active_alerts: activeAlerts,
+    active_alerts_by_severity: activeAlertsBySeverity,
     severity: classifyBusiness(activeAlerts, openIssues, !!(issues.error || incidents.error)),
     alerts: alertDetails,
     monitors,
