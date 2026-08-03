@@ -3,6 +3,10 @@
 Shared read-logic for the Global Monitoring plugins — one source of truth so
 the hub (pull) function and the tenant (push) cron don't drift.
 
+This repository is **not an installable plugin**. Do not upload it to the
+Catalog or install it on a tenant. The hub and push-template repositories pin it
+as `shared_lib` and inline `core.ts` into their packaged functions.
+
 ## Why a submodule + inline, not an npm dependency
 
 Catalog-plugin functions ship as a **single inlined `code.ts` string** and
